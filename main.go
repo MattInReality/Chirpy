@@ -39,63 +39,8 @@ func main() {
 	mux.HandleFunc("GET /api/healthz", handlerReadiness)
 	mux.HandleFunc("GET /admin/metrics", apiCfg.getMetrics)
 	mux.HandleFunc("POST /api/validate_chirp", handlerValidateChirp)
-	mux.HandleFunc("POST /api/users", func(w http.ResponseWriter, r *http.Request) {
-		type params struct {
-			Email string `json:"email"`
-		}
-		data := params{}
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			respondWithError(w, http.StatusInternalServerError, "error reading data", err)
-			return
-		}
-		err = json.Unmarshal(body, &data)
-		if err != nil {
-			respondWithError(w, http.StatusInternalServerError, "error unmarshalling data", err)
-			return
-		}
-		if _, err := mail.ParseAddress(data.Email); err != nil {
-			respondWithError(w, http.StatusBadRequest, "invalid email", err)
-			return
-		}
-		user := database.CreateUserParams{
-			Email:     data.Email,
-			ID:        uuid.New(),
-			CreatedAt: time.Now(),
-			UpdatedAt: time.Now(),
-		}
-		newUser, err := apiCfg.db.CreateUser(r.Context(), user)
-		if err != nil {
-			respondWithError(w, http.StatusInternalServerError, "error saving to db", err)
-			return
-		}
-		type User struct {
-			ID        uuid.UUID `json:"id"`
-			CreatedAt time.Time `json:"created_at"`
-			UpdatedAt time.Time `json:"updated_at"`
-			Email     string    `json:"email"`
-		}
-		resUser := User{
-			ID:        newUser.ID,
-			CreatedAt: newUser.CreatedAt,
-			UpdatedAt: newUser.UpdatedAt,
-			Email:     newUser.Email,
-		}
-		respondWithJson(w, http.StatusCreated, resUser)
-	})
-	mux.HandleFunc("/admin/reset", func(w http.ResponseWriter, r *http.Request) {
-		if apiCfg.platform != "dev" {
-			respondWithError(w, http.StatusForbidden, http.StatusText(http.StatusForbidden), nil)
-			return
-		}
-		err := apiCfg.db.DeleteAllUsers(r.Context())
-		if err != nil {
-			respondWithError(w, http.StatusInternalServerError, "issue deleting resource", err)
-			return
-		}
-		log.Println("should have deleted users")
-		w.WriteHeader(http.StatusOK)
-	})
+	mux.HandleFunc("POST /api/users", handlerCreateUser)
+	mux.HandleFunc("/admin/reset", apiCfg.handlerReset)
 
 	server := http.Server{
 		Addr:    ":" + port,
@@ -135,4 +80,63 @@ func (cfg *apiConfig) getMetrics(w http.ResponseWriter, _ *http.Request) {
 func (cfg *apiConfig) resetMetrics(w http.ResponseWriter, _ *http.Request) {
 	cfg.fileserverHits.Swap(0)
 	w.WriteHeader(http.StatusOK)
+}
+
+func (cfg *apiConfig) handlerReset(w http.ResponseWriter, r *http.Request) {
+	if cfg.platform != "dev" {
+		respondWithError(w, http.StatusForbidden, http.StatusText(http.StatusForbidden), nil)
+		return
+	}
+	err := cfg.db.DeleteAllUsers(r.Context())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "issue deleting resource", err)
+		return
+	}
+	log.Println("should have deleted users")
+	w.WriteHeader(http.StatusOK)
+}
+
+func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) {
+	type params struct {
+		Email string `json:"email"`
+	}
+	data := params{}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "error reading data", err)
+		return
+	}
+	err = json.Unmarshal(body, &data)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "error unmarshalling data", err)
+		return
+	}
+	if _, err := mail.ParseAddress(data.Email); err != nil {
+		respondWithError(w, http.StatusBadRequest, "invalid email", err)
+		return
+	}
+	user := database.CreateUserParams{
+		Email:     data.Email,
+		ID:        uuid.New(),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	newUser, err := cfg.db.CreateUser(r.Context(), user)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "error saving to db", err)
+		return
+	}
+	type User struct {
+		ID        uuid.UUID `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Email     string    `json:"email"`
+	}
+	resUser := User{
+		ID:        newUser.ID,
+		CreatedAt: newUser.CreatedAt,
+		UpdatedAt: newUser.UpdatedAt,
+		Email:     newUser.Email,
+	}
+	respondWithJson(w, http.StatusCreated, resUser)
 }
