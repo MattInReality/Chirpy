@@ -38,9 +38,9 @@ func main() {
 	mux.Handle("/app/", apiCfg.middlewareMetricsInc(http.StripPrefix("/app/", http.FileServer(http.Dir(filepathRoot)))))
 	mux.HandleFunc("GET /api/healthz", handlerReadiness)
 	mux.HandleFunc("GET /admin/metrics", apiCfg.getMetrics)
-	mux.HandleFunc("POST /api/validate_chirp", handlerValidateChirp)
-	mux.HandleFunc("POST /api/users", handlerCreateUser)
+	mux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
 	mux.HandleFunc("/admin/reset", apiCfg.handlerReset)
+	mux.HandleFunc("/api/chirps", apiCfg.handlerCreateChirp)
 
 	server := http.Server{
 		Addr:    ":" + port,
@@ -92,7 +92,6 @@ func (cfg *apiConfig) handlerReset(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusInternalServerError, "issue deleting resource", err)
 		return
 	}
-	log.Println("should have deleted users")
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -139,4 +138,40 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) 
 		Email:     newUser.Email,
 	}
 	respondWithJson(w, http.StatusCreated, resUser)
+}
+
+func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request) {
+	type params struct {
+		Body   string    `json:"body"`
+		UserID uuid.UUID `json:"user_id"`
+	}
+	const maxChirpLength = 140
+	defer r.Body.Close()
+	d := json.NewDecoder(r.Body)
+	p := params{}
+	w.Header().Add("Content-Type", "application/json")
+	err := d.Decode(&p)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Something went wrong", err)
+		return
+	}
+	if len(p.Body) > maxChirpLength {
+		respondWithError(w, http.StatusBadRequest, "Chirp is too long", nil)
+		return
+	}
+	badWords := getBadWords()
+	sanitisedChirp := sanitisedChirp(p.Body, badWords)
+
+	newChirp, err := cfg.db.CreateChirp(r.Context(), database.CreateChirpParams{ID: uuid.New(), CreatedAt: time.Now(), UpdatedAt: time.Now(), Body: sanitisedChirp, UserID: p.UserID})
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "issue inserting in to database", err)
+	}
+	type chirp struct {
+		ID        uuid.UUID `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Body      string    `json:"body"`
+		UserID    uuid.UUID `json:"user_id"`
+	}
+	respondWithJson(w, http.StatusCreated, chirp{ID: newChirp.ID, CreatedAt: newChirp.CreatedAt, UpdatedAt: newChirp.UpdatedAt, Body: newChirp.Body, UserID: newChirp.UserID})
 }
