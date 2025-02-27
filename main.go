@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"github.com/MattInReality/Chirpy/internal/auth"
 	"github.com/MattInReality/Chirpy/internal/database"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -39,8 +40,11 @@ func main() {
 	mux.HandleFunc("GET /api/healthz", handlerReadiness)
 	mux.HandleFunc("GET /admin/metrics", apiCfg.getMetrics)
 	mux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
-	mux.HandleFunc("/admin/reset", apiCfg.handlerReset)
-	mux.HandleFunc("/api/chirps", apiCfg.handlerCreateChirp)
+	mux.HandleFunc("POST /admin/reset", apiCfg.handlerReset)
+	mux.HandleFunc("POST /api/chirps", apiCfg.handlerCreateChirp)
+	mux.HandleFunc("GET /api/chirps", apiCfg.handlerGetChirps)
+	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerGetOneChirp)
+	mux.HandleFunc("POST /api/login", apiCfg.handlerUserLogin)
 
 	server := http.Server{
 		Addr:    ":" + port,
@@ -97,7 +101,8 @@ func (cfg *apiConfig) handlerReset(w http.ResponseWriter, r *http.Request) {
 
 func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) {
 	type params struct {
-		Email string `json:"email"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 	data := params{}
 	body, err := io.ReadAll(r.Body)
@@ -114,11 +119,17 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) 
 		respondWithError(w, http.StatusBadRequest, "invalid email", err)
 		return
 	}
+	hashed, err := auth.HashPassword(data.Password)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "something went wrong", err)
+		return
+	}
 	user := database.CreateUserParams{
-		Email:     data.Email,
-		ID:        uuid.New(),
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		Email:          data.Email,
+		ID:             uuid.New(),
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+		HashedPassword: hashed,
 	}
 	newUser, err := cfg.db.CreateUser(r.Context(), user)
 	if err != nil {
@@ -138,6 +149,14 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) 
 		Email:     newUser.Email,
 	}
 	respondWithJson(w, http.StatusCreated, resUser)
+}
+
+type chirp struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	UserID    uuid.UUID `json:"user_id"`
 }
 
 func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request) {
@@ -174,4 +193,75 @@ func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request)
 		UserID    uuid.UUID `json:"user_id"`
 	}
 	respondWithJson(w, http.StatusCreated, chirp{ID: newChirp.ID, CreatedAt: newChirp.CreatedAt, UpdatedAt: newChirp.UpdatedAt, Body: newChirp.Body, UserID: newChirp.UserID})
+}
+
+func (cfg *apiConfig) handlerGetChirps(w http.ResponseWriter, r *http.Request) {
+	chirps, err := cfg.db.GetChirps(r.Context())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "error getting data from database", err)
+		return
+	}
+	theChirps := []chirp{}
+	for _, c := range chirps {
+		chrp := chirp{
+			ID:        c.ID,
+			CreatedAt: c.CreatedAt,
+			UpdatedAt: c.UpdatedAt,
+			Body:      c.Body,
+			UserID:    c.UserID,
+		}
+		theChirps = append(theChirps, chrp)
+	}
+	respondWithJson(w, http.StatusOK, theChirps)
+}
+
+func (cfg *apiConfig) handlerGetOneChirp(w http.ResponseWriter, r *http.Request) {
+	var chirpID uuid.UUID
+	chirpID = uuid.MustParse(r.PathValue("chirpID"))
+	c, err := cfg.db.GetChirpByID(r.Context(), chirpID)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, http.StatusText(http.StatusBadRequest), err)
+		return
+	}
+	chrp := chirp{
+		ID:        c.ID,
+		CreatedAt: c.CreatedAt,
+		UpdatedAt: c.UpdatedAt,
+		Body:      c.Body,
+		UserID:    c.UserID,
+	}
+	respondWithJson(w, http.StatusOK, chrp)
+}
+
+func (cfg *apiConfig) handlerUserLogin(w http.ResponseWriter, r *http.Request) {
+	type params struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	data := params{}
+	d := json.NewDecoder(r.Body)
+	d.Decode(&data)
+	storedUser, err := cfg.db.GetUserByEmail(r.Context(), data.Email)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "please try again", err)
+		return
+	}
+	if err := auth.CheckPasswordHash(data.Password, storedUser.HashedPassword); err != nil {
+		respondWithError(w, http.StatusUnauthorized, "please try again", err)
+		return
+	}
+	type User struct {
+		ID        uuid.UUID `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Email     string    `json:"email"`
+	}
+	resUser := User{
+		ID:        storedUser.ID,
+		CreatedAt: storedUser.CreatedAt,
+		UpdatedAt: storedUser.UpdatedAt,
+		Email:     storedUser.Email,
+	}
+	respondWithJson(w, http.StatusOK, resUser)
+
 }
