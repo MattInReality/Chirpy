@@ -12,7 +12,7 @@ func respondWithError(w http.ResponseWriter, code int, message string, err error
 	}
 
 	if code > 499 {
-		log.Printf("responding with 5XX error: %s", message)
+		log.Printf("responding with 5XX error: %s\n", message)
 	}
 
 	type responseError struct {
@@ -25,7 +25,7 @@ func respondWithError(w http.ResponseWriter, code int, message string, err error
 func respondWithJson(w http.ResponseWriter, code int, body interface{}) {
 	data, err := json.Marshal(body)
 	if err != nil {
-		log.Printf("Error marshalling json: %s", err)
+		log.Printf("Error marshalling json: %s\n", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}

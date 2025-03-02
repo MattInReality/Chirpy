@@ -33,6 +33,7 @@ func main() {
 	apiCfg := &apiConfig{
 		db:       queries,
 		platform: os.Getenv("PLATFORM"),
+		secret:   os.Getenv("JWT_SECRET"),
 	}
 
 	mux := http.NewServeMux()
@@ -40,11 +41,15 @@ func main() {
 	mux.HandleFunc("GET /api/healthz", handlerReadiness)
 	mux.HandleFunc("GET /admin/metrics", apiCfg.getMetrics)
 	mux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
+	mux.HandleFunc("PUT /api/users", apiCfg.handlerUpdateUser)
 	mux.HandleFunc("POST /admin/reset", apiCfg.handlerReset)
 	mux.HandleFunc("POST /api/chirps", apiCfg.handlerCreateChirp)
 	mux.HandleFunc("GET /api/chirps", apiCfg.handlerGetChirps)
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.handlerDeleteChirp)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerGetOneChirp)
 	mux.HandleFunc("POST /api/login", apiCfg.handlerUserLogin)
+	mux.HandleFunc("POST /api/refresh", apiCfg.handlerRefresh)
+	mux.HandleFunc("POST /api/revoke", apiCfg.handlerRevokeRefresh)
 
 	server := http.Server{
 		Addr:    ":" + port,
@@ -66,6 +71,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
 	platform       string
+	secret         string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -160,6 +166,17 @@ type chirp struct {
 }
 
 func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request) {
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, http.StatusText(http.StatusUnauthorized), err)
+		return
+	}
+	userID, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, http.StatusText(http.StatusUnauthorized), err)
+		return
+	}
+
 	type params struct {
 		Body   string    `json:"body"`
 		UserID uuid.UUID `json:"user_id"`
@@ -169,21 +186,33 @@ func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request)
 	d := json.NewDecoder(r.Body)
 	p := params{}
 	w.Header().Add("Content-Type", "application/json")
-	err := d.Decode(&p)
+	err = d.Decode(&p)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Something went wrong", err)
 		return
 	}
+	p.UserID = userID
 	if len(p.Body) > maxChirpLength {
 		respondWithError(w, http.StatusBadRequest, "Chirp is too long", nil)
 		return
 	}
 	badWords := getBadWords()
-	sanitisedChirp := sanitisedChirp(p.Body, badWords)
+	chirpParam := database.CreateChirpParams{
+		ID:        uuid.New(),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		Body:      sanitisedChirp(p.Body, badWords),
+		UserID:    p.UserID,
+	}
+	log.Printf("%v", chirpParam)
 
-	newChirp, err := cfg.db.CreateChirp(r.Context(), database.CreateChirpParams{ID: uuid.New(), CreatedAt: time.Now(), UpdatedAt: time.Now(), Body: sanitisedChirp, UserID: p.UserID})
+	newChirp, err := cfg.db.CreateChirp(
+		r.Context(),
+		chirpParam,
+	)
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "issue inserting in to database", err)
+		return
 	}
 	type chirp struct {
 		ID        uuid.UUID `json:"id"`
@@ -220,7 +249,7 @@ func (cfg *apiConfig) handlerGetOneChirp(w http.ResponseWriter, r *http.Request)
 	chirpID = uuid.MustParse(r.PathValue("chirpID"))
 	c, err := cfg.db.GetChirpByID(r.Context(), chirpID)
 	if err != nil {
-		respondWithError(w, http.StatusBadRequest, http.StatusText(http.StatusBadRequest), err)
+		respondWithError(w, http.StatusNotFound, http.StatusText(http.StatusNotFound), err)
 		return
 	}
 	chrp := chirp{
@@ -250,18 +279,169 @@ func (cfg *apiConfig) handlerUserLogin(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusUnauthorized, "please try again", err)
 		return
 	}
+	token, err := auth.MakeJWT(storedUser.ID, cfg.secret, calculateTimeout(60*60))
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "please try again", err)
+		return
+	}
+	refreshToken, err := auth.MakeRefreshToken()
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "please try again", err)
+		return
+	}
+	now := time.Now()
+	_, err = cfg.db.CreateRefreshToken(
+		r.Context(),
+		database.CreateRefreshTokenParams{
+			Token:     refreshToken,
+			CreatedAt: now,
+			UpdatedAt: now,
+			UserID:    storedUser.ID,
+			ExpiresAt: now.AddDate(0, 0, 60),
+			RevokedAt: sql.NullTime{Valid: false},
+		},
+	)
 	type User struct {
-		ID        uuid.UUID `json:"id"`
-		CreatedAt time.Time `json:"created_at"`
-		UpdatedAt time.Time `json:"updated_at"`
-		Email     string    `json:"email"`
+		ID           uuid.UUID `json:"id"`
+		CreatedAt    time.Time `json:"created_at"`
+		UpdatedAt    time.Time `json:"updated_at"`
+		Email        string    `json:"email"`
+		Token        string    `json:"token"`
+		RefreshToken string    `json:"refresh_token"`
 	}
 	resUser := User{
-		ID:        storedUser.ID,
-		CreatedAt: storedUser.CreatedAt,
-		UpdatedAt: storedUser.UpdatedAt,
-		Email:     storedUser.Email,
+		ID:           storedUser.ID,
+		CreatedAt:    storedUser.CreatedAt,
+		UpdatedAt:    storedUser.UpdatedAt,
+		Email:        storedUser.Email,
+		Token:        token,
+		RefreshToken: refreshToken,
 	}
 	respondWithJson(w, http.StatusOK, resUser)
+}
 
+func (cfg *apiConfig) handlerRefresh(w http.ResponseWriter, r *http.Request) {
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, http.StatusText(http.StatusUnauthorized), err)
+	}
+	rt, err := cfg.db.GetUserFromRefreshToken(r.Context(), token)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, http.StatusText(http.StatusUnauthorized), err)
+		return
+	}
+	newToken, err := auth.MakeJWT(rt.ID, cfg.secret, calculateTimeout(60*60))
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "please try again", err)
+		return
+	}
+	type rParam struct {
+		Token string `json:"token"`
+	}
+	respondWithJson(w, http.StatusOK, rParam{Token: newToken})
+}
+
+func (cfg *apiConfig) handlerRevokeRefresh(w http.ResponseWriter, r *http.Request) {
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, http.StatusText(http.StatusUnauthorized), err)
+		return
+	}
+	now := time.Now()
+	err = cfg.db.RevokeRefreshToken(
+		r.Context(),
+		database.RevokeRefreshTokenParams{
+			Token:     token,
+			RevokedAt: sql.NullTime{Time: now, Valid: true},
+			UpdatedAt: now,
+		})
+	w.WriteHeader(204)
+}
+
+func (cfg *apiConfig) handlerUpdateUser(w http.ResponseWriter, r *http.Request) {
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, http.StatusText(http.StatusUnauthorized), err)
+		return
+	}
+	userID, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, http.StatusText(http.StatusUnauthorized), err)
+		return
+	}
+	type params struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	p := &params{}
+	d := json.NewDecoder(r.Body)
+	d.Decode(p)
+	user, err := cfg.db.GetUserByID(r.Context(), userID)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, http.StatusText(http.StatusUnauthorized), err)
+		return
+	}
+	if userID != user.ID {
+		respondWithError(w, http.StatusUnauthorized, http.StatusText(http.StatusUnauthorized), err)
+		return
+	}
+	hash, err := auth.HashPassword(p.Password)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, http.StatusText(http.StatusInternalServerError), err)
+		return
+	}
+	updated, err := cfg.db.UpdateUser(
+		r.Context(),
+		database.UpdateUserParams{
+			ID:             user.ID,
+			Email:          p.Email,
+			HashedPassword: hash,
+			UpdatedAt:      time.Now(),
+		})
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, http.StatusText(http.StatusInternalServerError), err)
+		return
+	}
+	type response struct {
+		ID        uuid.UUID `json:"id"`
+		Email     string    `json:"email"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+	}
+	respondWithJson(w, http.StatusOK, response{ID: updated.ID, Email: updated.Email, CreatedAt: updated.CreatedAt, UpdatedAt: updated.UpdatedAt})
+}
+
+func (cfg *apiConfig) handlerDeleteChirp(w http.ResponseWriter, r *http.Request) {
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, http.StatusText(http.StatusUnauthorized), err)
+		return
+	}
+	userID, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, http.StatusText(http.StatusUnauthorized), err)
+		return
+	}
+	chirpID, err := uuid.Parse(r.PathValue("chirpID"))
+	if err != nil {
+		respondWithError(w, http.StatusNotFound, http.StatusText(http.StatusNotFound), err)
+		return
+	}
+	deleted, err := cfg.db.DeleteChirp(r.Context(), database.DeleteChirpParams{
+		ID:     chirpID,
+		UserID: userID,
+	})
+	if err != nil {
+		respondWithError(w, http.StatusForbidden, http.StatusText(http.StatusForbidden), err)
+		return
+	}
+	log.Printf("%v\n", deleted)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func calculateTimeout(seconds int) time.Duration {
+	if seconds == 0 || seconds >= 60 {
+		return time.Duration(int64(time.Second) * 60 * 60)
+	}
+	return time.Duration(int64(time.Second) * int64(seconds))
 }
