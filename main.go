@@ -34,6 +34,7 @@ func main() {
 		db:       queries,
 		platform: os.Getenv("PLATFORM"),
 		secret:   os.Getenv("JWT_SECRET"),
+		apiKey:   os.Getenv("POLKA_KEY"),
 	}
 
 	mux := http.NewServeMux()
@@ -50,6 +51,7 @@ func main() {
 	mux.HandleFunc("POST /api/login", apiCfg.handlerUserLogin)
 	mux.HandleFunc("POST /api/refresh", apiCfg.handlerRefresh)
 	mux.HandleFunc("POST /api/revoke", apiCfg.handlerRevokeRefresh)
+	mux.HandleFunc("POST /api/polka/webhooks", apiCfg.handlerPolkaWebhook)
 
 	server := http.Server{
 		Addr:    ":" + port,
@@ -72,6 +74,7 @@ type apiConfig struct {
 	db             *database.Queries
 	platform       string
 	secret         string
+	apiKey         string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -143,16 +146,18 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	type User struct {
-		ID        uuid.UUID `json:"id"`
-		CreatedAt time.Time `json:"created_at"`
-		UpdatedAt time.Time `json:"updated_at"`
-		Email     string    `json:"email"`
+		ID          uuid.UUID `json:"id"`
+		CreatedAt   time.Time `json:"created_at"`
+		UpdatedAt   time.Time `json:"updated_at"`
+		Email       string    `json:"email"`
+		IsChirpyRed bool      `json:"is_chirpy_red"`
 	}
 	resUser := User{
-		ID:        newUser.ID,
-		CreatedAt: newUser.CreatedAt,
-		UpdatedAt: newUser.UpdatedAt,
-		Email:     newUser.Email,
+		ID:          newUser.ID,
+		CreatedAt:   newUser.CreatedAt,
+		UpdatedAt:   newUser.UpdatedAt,
+		Email:       newUser.Email,
+		IsChirpyRed: newUser.IsChirpyRed,
 	}
 	respondWithJson(w, http.StatusCreated, resUser)
 }
@@ -225,10 +230,26 @@ func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request)
 }
 
 func (cfg *apiConfig) handlerGetChirps(w http.ResponseWriter, r *http.Request) {
-	chirps, err := cfg.db.GetChirps(r.Context())
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "error getting data from database", err)
-		return
+	userID := r.URL.Query().Get("author_id")
+	var chirps []database.Chirp
+	var err error
+	if userID == "" {
+		chirps, err = cfg.db.GetChirps(r.Context())
+		if err != nil {
+			respondWithError(w, http.StatusInternalServerError, "error getting data from database", err)
+			return
+		}
+	} else {
+		uID, err := uuid.Parse(userID)
+		if err != nil {
+			respondWithError(w, http.StatusInternalServerError, "error getting data from database", err)
+			return
+		}
+		chirps, err = cfg.db.GetChirpsByUserID(r.Context(), uID)
+		if err != nil {
+			respondWithError(w, http.StatusInternalServerError, "error getting data from database", err)
+			return
+		}
 	}
 	theChirps := []chirp{}
 	for _, c := range chirps {
@@ -308,6 +329,7 @@ func (cfg *apiConfig) handlerUserLogin(w http.ResponseWriter, r *http.Request) {
 		Email        string    `json:"email"`
 		Token        string    `json:"token"`
 		RefreshToken string    `json:"refresh_token"`
+		IsChirpyRed  bool      `json:"is_chirpy_red"`
 	}
 	resUser := User{
 		ID:           storedUser.ID,
@@ -316,6 +338,7 @@ func (cfg *apiConfig) handlerUserLogin(w http.ResponseWriter, r *http.Request) {
 		Email:        storedUser.Email,
 		Token:        token,
 		RefreshToken: refreshToken,
+		IsChirpyRed:  storedUser.IsChirpyRed,
 	}
 	respondWithJson(w, http.StatusOK, resUser)
 }
@@ -403,12 +426,13 @@ func (cfg *apiConfig) handlerUpdateUser(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	type response struct {
-		ID        uuid.UUID `json:"id"`
-		Email     string    `json:"email"`
-		CreatedAt time.Time `json:"created_at"`
-		UpdatedAt time.Time `json:"updated_at"`
+		ID          uuid.UUID `json:"id"`
+		Email       string    `json:"email"`
+		CreatedAt   time.Time `json:"created_at"`
+		UpdatedAt   time.Time `json:"updated_at"`
+		IsChirpyRed bool      `json:"is_chirpy_red"`
 	}
-	respondWithJson(w, http.StatusOK, response{ID: updated.ID, Email: updated.Email, CreatedAt: updated.CreatedAt, UpdatedAt: updated.UpdatedAt})
+	respondWithJson(w, http.StatusOK, response{ID: updated.ID, Email: updated.Email, CreatedAt: updated.CreatedAt, UpdatedAt: updated.UpdatedAt, IsChirpyRed: updated.IsChirpyRed})
 }
 
 func (cfg *apiConfig) handlerDeleteChirp(w http.ResponseWriter, r *http.Request) {
@@ -436,6 +460,37 @@ func (cfg *apiConfig) handlerDeleteChirp(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	log.Printf("%v\n", deleted)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (cfg *apiConfig) handlerPolkaWebhook(w http.ResponseWriter, r *http.Request) {
+	providedKey, err := auth.GetAPIKey(r.Header)
+	if err != nil || providedKey != cfg.apiKey {
+		respondWithError(w, http.StatusUnauthorized, http.StatusText(http.StatusUnauthorized), err)
+		return
+	}
+	type params struct {
+		Event string `json:"event"`
+		Data  struct {
+			UserID uuid.UUID `json:"user_id"`
+		} `json:"data"`
+	}
+	p := &params{}
+	d := json.NewDecoder(r.Body)
+	err = d.Decode(p)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "issue decoding body", err)
+		return
+	}
+	if p.Event != "user.upgraded" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	err = cfg.db.UpgradeToRedByID(r.Context(), p.Data.UserID)
+	if err != nil {
+		respondWithError(w, http.StatusNotFound, http.StatusText(http.StatusNotFound), err)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

@@ -3,7 +3,7 @@ INSERT INTO users (id, created_at, updated_at, email, hashed_password)
 VALUES (
   $1, $2, $3, $4, $5
   )
-RETURNING id, created_at, updated_at, email;
+RETURNING id, created_at, updated_at, email, is_chirpy_red;
 -- name: DeleteAllUsers :exec
 DELETE FROM users;
 -- name: GetUserByEmail :one
@@ -17,3 +17,7 @@ UPDATE users SET
   updated_at = $3
 WHERE id = $4
 RETURNING *;
+-- name: UpgradeToRedByID :exec
+UPDATE users SET
+  is_chirpy_red = true
+WHERE id = $1;
