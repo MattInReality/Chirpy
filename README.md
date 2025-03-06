@@ -1,6 +1,8 @@
 # Chirpy API
 
-A RESTful API for the Chirpy social media platform.
+A RESTful API for the Chirpy social media platform. The project is a guided project built during a course from the great
+team at [boot.dev](https://boot.dev). Many of the problems are solved my way but the general structure of the project
+is aligned with the course material.
 
 ## Development
 - Server runs on port 8080 by default
