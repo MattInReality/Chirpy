@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/mail"
 	"os"
+	"sort"
 	"sync/atomic"
 	"time"
 )
@@ -231,6 +232,7 @@ func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request)
 
 func (cfg *apiConfig) handlerGetChirps(w http.ResponseWriter, r *http.Request) {
 	userID := r.URL.Query().Get("author_id")
+	sortBy := r.URL.Query().Get("sort")
 	var chirps []database.Chirp
 	var err error
 	if userID == "" {
@@ -250,6 +252,16 @@ func (cfg *apiConfig) handlerGetChirps(w http.ResponseWriter, r *http.Request) {
 			respondWithError(w, http.StatusInternalServerError, "error getting data from database", err)
 			return
 		}
+	}
+	if sortBy == "asc" {
+		sort.Slice(chirps, func(i, j int) bool {
+			return (chirps[i].CreatedAt.Compare(chirps[j].CreatedAt) < 0)
+		})
+	}
+	if sortBy == "desc" {
+		sort.Slice(chirps, func(i, j int) bool {
+			return (chirps[i].CreatedAt.Compare(chirps[j].CreatedAt) >= 0)
+		})
 	}
 	theChirps := []chirp{}
 	for _, c := range chirps {
